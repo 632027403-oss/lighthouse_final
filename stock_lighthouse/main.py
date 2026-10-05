@@ -422,9 +422,42 @@ async function loadStock() {
         </div>
 
         <div class="card">
-            <h3>历史相似条件统计</h3>
-            <pre>${JSON.stringify(data.historical_stats, null, 2)}</pre>
-        </div>
+    <h3>历史相似条件统计</h3>
+    <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+            <thead>
+                <tr>
+                    <th style="padding:8px;text-align:left;">周期</th>
+                    <th style="padding:8px;">样本</th>
+                    <th style="padding:8px;">上涨概率</th>
+                    <th style="padding:8px;">中位收益</th>
+                    <th style="padding:8px;">常见区间</th>
+                    <th style="padding:8px;">最差收益</th>
+                    <th style="padding:8px;">最大回撤</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${Object.entries(data.historical_stats || {}).map(([h, s]) => `
+                    <tr>
+                        <td style="padding:8px;">${h}日</td>
+                        <td style="padding:8px;text-align:center;">${s.n}</td>
+                        <td style="padding:8px;text-align:center;">${(s.up * 100).toFixed(1)}%</td>
+                        <td style="padding:8px;text-align:center;">${(s.median * 100).toFixed(1)}%</td>
+                        <td style="padding:8px;text-align:center;">
+                            ${(s.p25 * 100).toFixed(1)}% ～ ${(s.p75 * 100).toFixed(1)}%
+                        </td>
+                        <td style="padding:8px;text-align:center;">${(s.min * 100).toFixed(1)}%</td>
+                        <td style="padding:8px;text-align:center;">${(s.max_drawdown * 100).toFixed(1)}%</td>
+                    </tr>
+                `).join("")}
+            </tbody>
+        </table>
+    </div>
+
+    <p style="font-size:13px;color:#777;margin-top:12px;">
+        以上为历史上与当前条件相似时的统计结果，仅用于辅助判断，不代表未来必然结果。
+    </p>
+</div>
         `;
 
     } catch (error) {
