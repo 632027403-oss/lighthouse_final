@@ -306,3 +306,185 @@ async def asset(ticker):
         reliability,
         reliability_note
         ) = stats(close)
+    latest = close[-1]
+
+    return {
+        "ticker": ticker,
+        "price": latest,
+        "trend_score": round(score, 2),
+        "stage": stage,
+        "sma20": round(s20, 2),
+        "sma60": round(s60, 2),
+        "return_7d": round(r7 * 100, 2),
+        "return_30d": round(r30 * 100, 2),
+        "sample_count": sample_count,
+        "reliability": reliability,
+        "reliability_note": reliability_note,
+        "historical_stats": horizons,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.get("/")
+async def home():
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lighthouse US Stocks</title>
+<style>
+body {
+    font-family: Arial, sans-serif;
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 20px;
+    background: #f5f7fa;
+    color: #222;
+}
+h1 { margin-bottom: 8px; }
+.card {
+    background: white;
+    border-radius: 12px;
+    padding: 16px;
+    margin: 12px 0;
+    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+}
+button {
+    padding: 10px 16px;
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+}
+input {
+    padding: 10px;
+    width: 180px;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+}
+.error { color: #b00020; }
+.big { font-size: 28px; font-weight: bold; }
+</style>
+</head>
+
+<body>
+
+<h1>🔦 Lighthouse US Stocks</h1>
+<p>证据先行 · 中期为主 · 统计验证 · 不造数据</p>
+
+<div class="card">
+    <input id="ticker" value="AMD" placeholder="输入股票代码">
+    <button onclick="loadStock()">分析</button>
+</div>
+
+<div id="result"></div>
+
+<script>
+async function loadStock() {
+    const ticker = document.getElementById("ticker").value.trim().toUpperCase();
+
+    if (!ticker) return;
+
+    const box = document.getElementById("result");
+    box.innerHTML = "<div class='card'>正在获取公开行情并计算统计……</div>";
+
+    try {
+        const response = await fetch(
+            "/api/asset?ticker=" + encodeURIComponent(ticker)
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.detail || "分析失败");
+        }
+
+        box.innerHTML = `
+        <div class="card">
+            <h2>${data.ticker}</h2>
+            <div class="big">$${data.price.toFixed(2)}</div>
+
+            <p>趋势：<b>${data.stage}</b></p>
+            <p>趋势评分：<b>${data.trend_score}</b> / 100</p>
+
+            <p>20日均线：$${data.sma20.toFixed(2)}</p>
+            <p>60日均线：$${data.sma60.toFixed(2)}</p>
+
+            <p>7日收益：${data.return_7d}%</p>
+            <p>30日收益：${data.return_30d}%</p>
+
+            <hr>
+
+            <p>历史相似样本：<b>${data.sample_count}</b></p>
+            <p>统计可靠度：<b>${data.reliability}</b></p>
+            <p>${data.reliability_note}</p>
+        </div>
+
+        <div class="card">
+            <h3>历史相似条件统计</h3>
+            <pre>${JSON.stringify(data.historical_stats, null, 2)}</pre>
+        </div>
+        `;
+
+    } catch (error) {
+        box.innerHTML =
+            "<div class='card error'>" +
+            error.message +
+            "</div>";
+    }
+}
+
+async function loadDefault(ticker) {
+    document.getElementById("ticker").value = ticker;
+    await loadStock();
+}
+
+loadDefault("AMD");
+</script>
+
+</body>
+</html>
+""")
+
+
+@app.get("/api/asset")
+async def api_asset(
+    ticker: str = Query(..., min_length=1, max_length=15)
+):
+    try:
+        return await asset(ticker)
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": str(e)}
+        )
+    except httpx.HTTPError:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": "公开行情源暂时无法访问"}
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "股票分析过程中发生内部错误"}
+        )
+
+
+@app.get("/api/defaults")
+async def api_defaults():
+    results = []
+
+    for ticker in DEFAULTS:
+        try:
+            results.append(await asset(ticker))
+        except Exception as e:
+            results.append({
+                "ticker": ticker,
+                "error": str(e)
+            })
+
+    return {
+        "assets": results,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
