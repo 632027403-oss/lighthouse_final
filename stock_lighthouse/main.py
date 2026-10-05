@@ -305,4 +305,4 @@ async def asset(ticker):
         sample_count,
         reliability,
         reliability_note
-    ) = 
+        ) = stats(close)
