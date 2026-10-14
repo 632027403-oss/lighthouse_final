@@ -4,7 +4,7 @@ import asyncio, csv, io, math, re, statistics, time
 from datetime import datetime, timezone
 import httpx
 
-app = FastAPI(title="Lighthouse Crypto", version="1.0-final")
+app = FastAPI(title="Lighthouse Crypto", version="1.1-evidence")
 
 CRYPTO = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT",
           "ADAUSDT","AVAXUSDT","LINKUSDT","SUIUSDT","LTCUSDT","BCHUSDT",
@@ -216,25 +216,87 @@ def build_evidence(src, der, macro_data, hist, etf_data, symbol):
     return {"pro": pro, "counter": counter}
 
 def make_asset(symbol, src, der, hist, macro_data, etf_data):
+    """MAI-style descriptive score for crypto. Medium structure preferred over pure 7d noise."""
     vals = [v for v in src.values() if v and v.get("available")]
     if not vals: return {"symbol": symbol, "status": "公开现货数据暂缺", "sources": src}
-    price = statistics.median([v["price"] for v in vals]); changes = [v["change24h"] for v in vals if v.get("change24h") is not None]
+    price = statistics.median([v["price"] for v in vals])
+    changes = [v["change24h"] for v in vals if v.get("change24h") is not None]
     buy = []
     for v in vals:
         for key in ("book_buy", "aggressive_buy"):
             if key in v: buy.append(v[key])
-    buy_power = safe_mean(buy) or .5; rows = hist.get("rows", [])
-    ret7 = pct(price, rows[-8]["close"]) if len(rows) >= 8 else safe_mean(changes); ret30 = pct(price, rows[-31]["close"]) if len(rows) >= 31 else ret7
-    funding = der.get("funding"); score = 50.0; score += max(-18, min(18, (ret7 or 0) * 1.2)); score += max(-24, min(24, (ret30 or 0) * .8)); score += max(-8, min(8, (buy_power - .5) * 80))
-    if funding is not None: score += -5 if funding > .0005 else 3 if funding < -.0005 else 0
-    score = round(max(0, min(100, score)), 1); mid = "中期偏多" if score >= 62 else "中期偏空" if score <= 38 else "中期震荡/观察"
-    short = "短期偏强" if (safe_mean(changes) or 0) > .5 else "短期偏弱" if (safe_mean(changes) or 0) < -.5 else "短期震荡"; conflict = (ret7 or 0) * (ret30 or 0) < 0; stats = hist.get("stats", {}); prob = historical_probability(stats)
-    return {"symbol": symbol, "status": "可分析", "sources": src, "price": price, "price_source": "多交易所现货中位数", "updated": ts(),
-            "completeness": len(vals), "change24h": round(safe_mean(changes) or 0, 2), "buy_power": round(buy_power*100, 1),
-            "ret7": round(ret7, 2) if ret7 is not None else None, "ret30": round(ret30, 2) if ret30 is not None else None,
-            "trend": {"mid": mid, "short": short, "stage": "趋势形成/延续" if abs(ret30 or 0) >= 8 else "整理/待确认", "score": score, "reversal_risk": "较高" if conflict else "中等" if abs(ret7 or 0) > 4 else "中低"},
-            "derivatives": {k:v for k,v in der.items() if k != "source"}, "history": {"stats": stats, "max_drawdown_90d": hist.get("max_drawdown_90d"), "max_drawdown_all": hist.get("max_drawdown_all"), "source": hist.get("source"), "last_date": hist.get("last_date")},
-            "stat_probability": prob, "probability_basis": "历史相似条件加权上涨率（样本≥20）" if prob is not None else "样本不足，不显示统计概率", "evidence": build_evidence(src, der, macro_data, hist, etf_data, symbol)}
+    buy_power = safe_mean(buy) or .5
+    rows = hist.get("rows", [])
+    closes = [r["close"] for r in rows]
+    ret7 = pct(price, rows[-8]["close"]) if len(rows) >= 8 else safe_mean(changes)
+    ret30 = pct(price, rows[-31]["close"]) if len(rows) >= 31 else ret7
+    ret63 = pct(price, rows[-64]["close"]) if len(rows) >= 64 else ret30
+    # Simple SMA structure on daily closes
+    sma20 = safe_mean(closes[-20:]) if len(closes) >= 20 else price
+    sma60 = safe_mean(closes[-60:]) if len(closes) >= 60 else price
+    above60 = price > sma60 if sma60 else False
+    s20_gt_s60 = (sma20 > sma60) if (sma20 and sma60) else False
+    funding = der.get("funding")
+    # Structure + medium momentum (lower weight on 7d)
+    score = 50.0
+    score += 12 if above60 else -12
+    score += 8 if s20_gt_s60 else -6
+    score += max(-20, min(20, (ret63 or 0) * 0.5))
+    score += max(-12, min(12, (ret30 or 0) * 0.35))
+    score += max(-6, min(6, (ret7 or 0) * 0.25))
+    score += max(-6, min(6, (buy_power - .5) * 40))
+    if funding is not None:
+        score += -6 if funding > .0005 else 3 if funding < -.0005 else 0
+    score = round(max(0, min(100, score)), 1)
+    if above60 and s20_gt_s60 and (ret63 or 0) > 0:
+        mid = "中期结构偏多"
+        invalidation = "若日线收盘跌破60日均线，中期结构视为破坏"
+    elif (not above60) and (not s20_gt_s60) and (ret63 or 0) < 0:
+        mid = "中期结构偏空"
+        invalidation = "若日线重新站上60日均线，空头结构减弱"
+    elif above60 and (ret63 or 0) < -5:
+        mid = "结构仍在但动能转弱"
+        invalidation = "关注是否跌破60日均线"
+    else:
+        mid = "中期震荡/观察"
+        invalidation = "等待价格与60日均线关系明确"
+    short = "短期偏强" if (safe_mean(changes) or 0) > .5 else "短期偏弱" if (safe_mean(changes) or 0) < -.5 else "短期震荡"
+    conflict = (ret7 or 0) * (ret30 or 0) < 0
+    stats = hist.get("stats", {})
+    prob = historical_probability(stats)
+    sc = stats.get("sample_count", 0) if isinstance(stats, dict) else 0
+    return {
+        "symbol": symbol, "status": "可分析", "sources": src, "price": price,
+        "price_source": "多交易所现货中位数", "updated": ts(),
+        "completeness": len(vals), "change24h": round(safe_mean(changes) or 0, 2),
+        "buy_power": round(buy_power * 100, 1),
+        "ret7": round(ret7, 2) if ret7 is not None else None,
+        "ret30": round(ret30, 2) if ret30 is not None else None,
+        "ret63": round(ret63, 2) if ret63 is not None else None,
+        "sma20": round(sma20, 4) if sma20 else None,
+        "sma60": round(sma60, 4) if sma60 else None,
+        "trend": {
+            "mid": mid, "short": short,
+            "stage": mid,
+            "score": score,
+            "score_name": "动量对齐指数(MAI)",
+            "score_disclaimer": "描述性指数，非预测概率；不构成买卖建议",
+            "invalidation": invalidation,
+            "reversal_risk": "较高" if conflict else "中等" if abs(ret7 or 0) > 4 else "中低",
+            "structure_broken": (not above60) and (not s20_gt_s60),
+        },
+        "derivatives": {k: v for k, v in der.items() if k != "source"},
+        "history": {
+            "stats": stats,
+            "max_drawdown_90d": hist.get("max_drawdown_90d"),
+            "max_drawdown_all": hist.get("max_drawdown_all"),
+            "source": hist.get("source"),
+            "last_date": hist.get("last_date"),
+        },
+        "stat_probability": prob,
+        "probability_basis": "历史相似条件加权上涨率（样本≥20）" if prob is not None else "样本不足，不显示条件上涨率",
+        "evidence": build_evidence(src, der, macro_data, hist, etf_data, symbol),
+    }
 
 async def scan_one(c, symbol, macro_data, etf_data):
     async def safe(name, fn):
@@ -292,11 +354,11 @@ async def search(symbol: str = Query(..., min_length=1, max_length=30)):
 
 HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🔦 灯塔 Crypto</title><style>
 :root{--bg:#07111f;--card:#0d1a2b;--line:#223650;--txt:#edf5ff;--muted:#91a6bf}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,"Segoe UI","Noto Sans SC",sans-serif}main{max-width:920px;margin:auto;padding:14px}.top{display:flex;justify-content:space-between;gap:10px;align-items:center}.brand{font-size:23px;font-weight:850}.sub,.small{font-size:11px;color:var(--muted);line-height:1.5}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-top:10px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.rank{padding:10px 0;border-bottom:1px solid #20324a}.rank:last-child{border:0}.row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid #20324a;font-size:12px}.row:last-child{border:0}.price{font-size:25px;font-weight:850}.tag{font-size:11px;background:#172941;border-radius:8px;padding:3px 6px;color:#bfd1e8}input,button{border:1px solid var(--line);background:#10243b;color:var(--txt);border-radius:11px;padding:9px}input{width:70%}@media(max-width:650px){.grid{grid-template-columns:1fr}}
-</style></head><body><main><div class="top"><div><div class="brand">🔦 灯塔 Crypto</div><div class="sub">证据先行 · 中期为主 · 统计验证 · 不造数据</div></div><div id="status" class="small">启动扫描</div></div><div class="card"><input id="q" placeholder="输入 BTC / ETH / SOL…"><button onclick="searchA()">搜索</button><div class="small">只返回已接入公开数据；未覆盖资产不会假装已经分析。</div></div><div class="card"><b>数据完整度</b><div id="sources"></div><div class="small">多交易所、衍生品、宏观与ETF分别显示；缺失层不会被填成假数据。</div></div><div class="grid"><section class="card"><h2>🪙 Crypto Top 3</h2><div id="rank"></div></section><section class="card"><h2>宏观 / BTC机构需求</h2><div id="macro"></div><div id="etf"></div></section></div><div id="detail"></div><div class="card"><h2>统计规则</h2><div class="small">历史相似条件来自真实日线；输出1/3/7/30/90日上涨/下跌频率、中位收益、区间、最差收益与历史路径最大回撤。相似样本少于20时不显示统计概率。概率不是模型拍脑袋预测。</div></div></main><script>
+</style></head><body><main><div class="top"><div><div class="brand">🔦 灯塔 Crypto</div><div class="sub">证据先行 · 中期结构 · 条件统计 · 不造概率 · v1.1</div></div><div id="status" class="small">启动扫描</div></div><div class="card"><input id="q" placeholder="输入 BTC / ETH / SOL…"><button onclick="searchA()">搜索</button><div class="small">只返回已接入公开数据；未覆盖资产不会假装已经分析。</div></div><div class="card"><b>数据完整度</b><div id="sources"></div><div class="small">多交易所、衍生品、宏观与ETF分别显示；缺失层不会被填成假数据。</div></div><div class="grid"><section class="card"><h2>🪙 Crypto Top 3</h2><div id="rank"></div></section><section class="card"><h2>宏观 / BTC机构需求</h2><div id="macro"></div><div id="etf"></div></section></div><div id="detail"></div><div class="card"><h2>统计规则</h2><div class="small">历史相似条件来自真实日线；输出1/3/7/30/90日上涨/下跌频率、中位收益、区间、最差收益与历史路径最大回撤。相似样本少于20时不显示条件上涨率。概率不是模型拍脑袋预测。</div></div></main><script>
 const $=id=>document.getElementById(id),esc=s=>String(s??'—').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
 function row(a,b){return `<div class="row"><span>${esc(a)}</span><b>${esc(b)}</b></div>`}function stat(s){if(!s||!s.sample_count)return '<div class="small">历史相似样本不足</div>';return ['1d','3d','7d','30d','90d'].map(k=>s[k]?row(k.toUpperCase(),`↑ ${s[k].up_rate}% / ↓ ${s[k].down_rate}% · 中位 ${s[k].median}% · 区间 ${s[k].worst}% ~ ${s[k].best}%`):'').join('')}
-function render(x){$('status').textContent='最近更新 '+(x.updated?new Date(x.updated).toLocaleTimeString():'—')+' · '+x.scan_status;$('sources').innerHTML=Object.entries(x.sources||{}).map(([k,v])=>row(k,v?'可用':'暂缺')).join('');$('rank').innerHTML=(x.crypto_rank||[]).slice(0,3).map((s,i)=>{let a=x.assets[s],t=a.trend||{};return `<div class="rank"><b>${i+1}. ${esc(s.replace('USDT',''))}</b> <span class="tag">${esc(t.mid)}</span>${row('价格','$'+Number(a.price).toLocaleString(undefined,{maximumFractionDigits:2}))}${row('中期',t.mid)}${row('短期',t.short)}${row('趋势评分',t.score)}${row('7日',a.ret7+'%')}${row('30日',a.ret30+'%')}${row('统计概率',a.stat_probability==null?'样本不足':a.stat_probability+'%')}${row('历史样本',a.history?.stats?.sample_count||0)}${row('90日最大回撤',a.history?.max_drawdown_90d==null?'样本不足':a.history.max_drawdown_90d+'%')}</div>`}).join('');let m=x.macro||{};$('macro').innerHTML=Object.entries(m).map(([k,v])=>row(k,v?.value??'暂缺')).join('');let e=x.etf||{};$('etf').innerHTML=e.available?row('BTC ETF最近日',`${e.latest.date} · ${e.latest.total>0?'+':''}${e.latest.total} US$m`):row('BTC ETF','暂缺');}
-async function load(){try{render(await fetch('/api/state',{cache:'no-store'}).then(r=>r.json()))}catch(e){$('status').textContent='连接异常'}}async function searchA(){let q=$('q').value.trim();if(!q)return;let d=await fetch('/api/search?symbol='+encodeURIComponent(q)).then(r=>r.json());$('detail').innerHTML='<div class="card"><h2>'+esc(q.toUpperCase())+'</h2>'+row('价格',d.price==null?'暂缺':'$'+Number(d.price).toLocaleString(undefined,{maximumFractionDigits:2}))+row('状态',d.status||'可分析')+(d.trend?row('中期',d.trend.mid)+row('短期',d.trend.short)+row('趋势评分',d.trend.score)+row('反转风险',d.trend.reversal_risk)+row('数据完整度',d.completeness+'/3')+row('统计概率',d.stat_probability==null?'样本不足':d.stat_probability+'%')+row('90日最大回撤',d.history.max_drawdown_90d==null?'样本不足':d.history.max_drawdown_90d+'%')+row('全历史最大回撤',d.history.max_drawdown_all==null?'样本不足':d.history.max_drawdown_all+'%')+stat(d.history.stats)+'<h3>正方证据</h3>'+d.evidence.pro.map(z=>'<div class="small">'+esc(z.name)+'：'+esc(z.detail)+'</div>').join('')+'<h3>反方证据</h3>'+d.evidence.counter.map(z=>'<div class="small">'+esc(z.name)+'：'+esc(z.detail)+'</div>').join(''):'')+'</div>'}load();setInterval(load,30000);
+function render(x){$('status').textContent='最近更新 '+(x.updated?new Date(x.updated).toLocaleTimeString():'—')+' · '+x.scan_status;$('sources').innerHTML=Object.entries(x.sources||{}).map(([k,v])=>row(k,v?'可用':'暂缺')).join('');$('rank').innerHTML=(x.crypto_rank||[]).slice(0,3).map((s,i)=>{let a=x.assets[s],t=a.trend||{};return `<div class="rank"><b>${i+1}. ${esc(s.replace('USDT',''))}</b> <span class="tag">${esc(t.mid)}</span>${row('价格','$'+Number(a.price).toLocaleString(undefined,{maximumFractionDigits:2}))}${row('中期',t.mid)}${row('短期',t.short)}${row('对齐指数',t.score)}${row('7日',a.ret7+'%')}${row('30日',a.ret30+'%')}${row('条件上涨率',a.stat_probability==null?'样本不足':a.stat_probability+'%')}${row('历史样本',a.history?.stats?.sample_count||0)}${row('90日最大回撤',a.history?.max_drawdown_90d==null?'样本不足':a.history.max_drawdown_90d+'%')}</div>`}).join('');let m=x.macro||{};$('macro').innerHTML=Object.entries(m).map(([k,v])=>row(k,v?.value??'暂缺')).join('');let e=x.etf||{};$('etf').innerHTML=e.available?row('BTC ETF最近日',`${e.latest.date} · ${e.latest.total>0?'+':''}${e.latest.total} US$m`):row('BTC ETF','暂缺');}
+async function load(){try{render(await fetch('/api/state',{cache:'no-store'}).then(r=>r.json()))}catch(e){$('status').textContent='连接异常'}}async function searchA(){let q=$('q').value.trim();if(!q)return;let d=await fetch('/api/search?symbol='+encodeURIComponent(q)).then(r=>r.json());$('detail').innerHTML='<div class="card"><h2>'+esc(q.toUpperCase())+'</h2>'+row('价格',d.price==null?'暂缺':'$'+Number(d.price).toLocaleString(undefined,{maximumFractionDigits:2}))+row('状态',d.status||'可分析')+(d.trend?row('中期',d.trend.mid)+row('短期',d.trend.short)+row('对齐指数',d.trend.score)+row('反转风险',d.trend.reversal_risk)+row('数据完整度',d.completeness+'/3')+row('条件上涨率',d.stat_probability==null?'样本不足':d.stat_probability+'%')+row('90日最大回撤',d.history.max_drawdown_90d==null?'样本不足':d.history.max_drawdown_90d+'%')+row('全历史最大回撤',d.history.max_drawdown_all==null?'样本不足':d.history.max_drawdown_all+'%')+stat(d.history.stats)+'<h3>正方证据</h3>'+d.evidence.pro.map(z=>'<div class="small">'+esc(z.name)+'：'+esc(z.detail)+'</div>').join('')+'<h3>反方证据</h3>'+d.evidence.counter.map(z=>'<div class="small">'+esc(z.name)+'：'+esc(z.detail)+'</div>').join(''):'')+'</div>'}load();setInterval(load,30000);
 </script></body></html>'''
 
 @app.get("/", response_class=HTMLResponse)
