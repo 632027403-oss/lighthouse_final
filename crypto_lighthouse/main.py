@@ -187,11 +187,45 @@ async def macro_background(c: httpx.AsyncClient) -> dict[str, Any]:
     fed, dgs10, dxy = await asyncio.gather(
         fred_one("FEDFUNDS"), fred_one("DGS10"), fred_one("DTWEXBGS")
     )
+    # Plain-language environment tags (descriptive only)
+    bits = []
+    if fed and isinstance(fed.get("value"), (int, float)):
+        v = fed["value"]
+        if v >= 4.5:
+            bits.append("政策利率仍偏高，借钱成本不低")
+        elif v <= 2.0:
+            bits.append("政策利率偏低，借钱相对便宜")
+        else:
+            bits.append("政策利率处于中间地带")
+    if dgs10 and isinstance(dgs10.get("value"), (int, float)):
+        v = dgs10["value"]
+        if v >= 4.0:
+            bits.append("长期利率偏高，对爱涨价的资产往往不太友好")
+        elif v <= 2.5:
+            bits.append("长期利率偏低，风险资产有时更容易被追捧")
+        else:
+            bits.append("长期利率不高不低")
+    if dxy and isinstance(dxy.get("value"), (int, float)):
+        v = dxy["value"]
+        if v >= 105:
+            bits.append("美元偏强时，以美元计价的币价常更吃力")
+        elif v <= 95:
+            bits.append("美元偏弱时，币价有时更容易抬头")
+        else:
+            bits.append("美元强弱大致中性")
+
     out = {
         "fed_funds": fed,
         "ust_10y": dgs10,
         "dollar_index": dxy,
-        "label": "宏观背景（描述性，不合成买卖分）",
+        "plain_lines": bits,
+        "how_it_works": (
+            "大环境不直接下单，但会影响大家愿不愿意买风险资产。"
+            "利率升高或美元变强时，股票和币常常更难涨、更容易晃；"
+            "利率回落或美元变弱时，往往更容易有人愿意追涨。"
+            "这只是常见倾向，不是定律，也不是买卖信号。"
+        ),
+        "label": "外面的大环境（只作背景，不合成买卖分）",
     }
     cache["macro"] = {"ts": ts(), "data": out}
     return out
@@ -242,18 +276,31 @@ def structure_state(closes: list[float], price: float) -> dict[str, Any]:
     }
 
 
+def window_peak_trough(values: list[float]) -> tuple[float | None, float | None]:
+    if not values:
+        return None, None
+    return max(values), min(values)
+
+
 def risk_metrics(closes: list[float], price: float) -> dict[str, Any]:
     if len(closes) < 30:
         return {}
     series = closes + ([price] if closes[-1] != price else [])
     daily = [series[i] / series[i - 1] - 1 for i in range(1, len(series))]
     vol20 = statistics.pstdev(daily[-20:]) if len(daily) >= 20 else None
-    mdd_90 = max_drawdown(series[-91:]) if len(series) >= 91 else max_drawdown(series)
+    w90 = series[-91:] if len(series) >= 91 else series
+    mdd_90 = max_drawdown(w90)
     mdd_all = max_drawdown(series)
+    peak90, trough90 = window_peak_trough(w90)
+    peak_all, trough_all = window_peak_trough(series)
     return {
         "vol20_daily_pct": round(vol20 * 100, 2) if vol20 is not None else None,
         "max_drawdown_90d": round(mdd_90, 4),
         "max_drawdown_all": round(mdd_all, 4),
+        "peak_90d": round(peak90, 4) if peak90 is not None else None,
+        "trough_90d": round(trough90, 4) if trough90 is not None else None,
+        "peak_all": round(peak_all, 4) if peak_all is not None else None,
+        "trough_all": round(trough_all, 4) if trough_all is not None else None,
         "stress_prices": {
             "down_10pct": round(price * 0.90, 4),
             "down_20pct": round(price * 0.80, 4),
@@ -466,13 +513,20 @@ function plainState(st){
   if(st.state.indexOf('回升')>=0) return '还在平均价下面，不过最近有抬头，还没算真正翻过来。';
   return '上上下下拉锯，方向还不清楚。';
 }
+function money(x){
+  if(typeof x!=='number')return '—';
+  if(x>=1000) return '$'+x.toLocaleString(undefined,{maximumFractionDigits:2});
+  return '$'+Number(x).toPrecision(6).replace(/\.?0+$/,'');
+}
 function plainRisk(rk){
   const d90=rk&&rk.max_drawdown_90d;
   if(typeof d90!=='number')return '最近跌幅数据暂时没有。';
-  const a=Math.abs(d90*100).toFixed(0);
-  if(Math.abs(d90)>=0.30) return `最近大约3个月里，从高点最多掉过约 ${a}%。晃得很猛，仓位要格外小心。`;
-  if(Math.abs(d90)>=0.15) return `最近大约3个月里，从高点最多掉过约 ${a}%。在币圈算常见晃动。`;
-  return `最近大约3个月里，从高点最多掉过约 ${a}%。相对不算猛（以后未必如此）。`;
+  const a=Math.abs(d90*100).toFixed(1);
+  let s=`最近大约3个月里，高点大约在 ${money(rk.peak_90d)}，最低大约到 ${money(rk.trough_90d)}，等于从高点最多掉过约 ${a}%。`;
+  if(Math.abs(d90)>=0.30) s+=' 晃得很猛，仓位要格外小心。';
+  else if(Math.abs(d90)>=0.15) s+=' 在币圈算常见晃动。';
+  else s+=' 相对不算猛（以后未必如此）。';
+  return s;
 }
 function row(k,v){return `<div>${esc(k)}：${esc(v)}</div>`}
 function render(x){
@@ -488,17 +542,23 @@ function render(x){
       <p>${esc(plainState(st))}</p>
       <p class="muted">${esc(plainRisk(rk))}</p>
       <details><summary>数字细节（可点开）</summary>
+        <p class="muted">近3个月平均价 ${money(st.sma60)} · 近半年 ${money(st.sma120)}</p>
         <p class="muted">近1个月 ${st.return_21d??'—'}% · 近3个月 ${st.return_63d??'—'}%</p>
-        <p class="muted">近3个月最多掉过 ${pct(rk.max_drawdown_90d)} · 晃动 ${rk.vol20_daily_pct??'—'}%</p>
+        <p class="muted">近3个月高点 ${money(rk.peak_90d)} → 最低 ${money(rk.trough_90d)}（约掉 ${pct(rk.max_drawdown_90d)}）</p>
       </details>
     </div>`;
   }).join('')||'<p class="muted">列表加载中…</p>';
   const m=x.macro||{};
+  const lines=(m.plain_lines||[]).map(t=>'<p>· '+esc(t)+'</p>').join('');
   $('macro').innerHTML=[
+    '<p class="lead">'+esc(m.how_it_works||'大环境影响大家买风险资产的意愿，但不决定某一天必涨必跌。')+'</p>',
+    lines||'<p class="muted">环境句子生成中…</p>',
+    '<details><summary>具体数字（可点开）</summary>',
     m.fed_funds?row('美国政策利率', m.fed_funds.value+'（'+m.fed_funds.date+'）'):'',
     m.ust_10y?row('美国10年期国债利率', m.ust_10y.value+'（'+m.ust_10y.date+'）'):'',
-    m.dollar_index?row('美元强弱', m.dollar_index.value):'',
-    '<p class="muted">只是外面大环境，不会自动变成买卖建议。</p>'
+    m.dollar_index?row('美元指数', m.dollar_index.value+(m.dollar_index.date?('（'+m.dollar_index.date+'）'):'')):'',
+    '</details>',
+    '<p class="muted">'+esc(m.label||'')+'</p>'
   ].join('')||'暂缺';
 }
 async function load(){try{render(await fetch('/api/state',{cache:'no-store'}).then(r=>r.json()))}catch(e){$('status').textContent='连接异常'}}
@@ -533,14 +593,17 @@ async function searchA(){
     <p class="big">$${Number(d.price).toLocaleString(undefined,{maximumFractionDigits:2})}</p>
     <p><span class="${tag}">${esc(st.state)}</span></p>
     <p class="lead">${esc(plainState(st))}</p>
+    <p>近3个月平均价 <b>${money(st.sma60)}</b> · 近半年平均价 <b>${money(st.sma120)}</b></p>
     <p class="warn">什么情况算变了：${esc(st.invalidation||'')}</p>
   </div>
   <div class="card">
     <h3>曾经跌过多少（先看这里）</h3>
     <p class="lead">${esc(plainRisk(rk))}</p>
-    <p>能查到的历史里，从高点最多掉过：<b>${pct(rk.max_drawdown_all)}</b></p>
-    <p class="muted">如果从现在再跌 10% / 20% / 30%，大约到
-      ${rk.stress_prices?.down_10pct} / ${rk.stress_prices?.down_20pct} / ${rk.stress_prices?.down_30pct}</p>
+    <p>能查到的历史里：高点约 <b>${money(rk.peak_all)}</b>，最低约 <b>${money(rk.trough_all)}</b>，从高点最多掉过 <b>${pct(rk.max_drawdown_all)}</b>。</p>
+    <p class="muted">如果从现在的 ${money(d.price)} 再跌：<br>
+      跌10% → 约 ${money(rk.stress_prices?.down_10pct)}<br>
+      跌20% → 约 ${money(rk.stress_prices?.down_20pct)}<br>
+      跌30% → 约 ${money(rk.stress_prices?.down_30pct)}</p>
   </div>
   <div class="card">
     <h3>以前遇到类似情况时</h3>
@@ -550,9 +613,10 @@ async function searchA(){
   <div class="card">
     <details>
       <summary>数字细节（可点开）</summary>
-      <p>近3个月平均价 ${st.sma60} · 近半年平均价 ${st.sma120}</p>
+      <p>近3个月平均价：<b>${money(st.sma60)}</b> · 近半年平均价：<b>${money(st.sma120)}</b></p>
       <p>近1个月 ${st.return_21d??'—'}% · 近3个月 ${st.return_63d??'—'}%</p>
-      <p>最近晃动程度 ${rk.vol20_daily_pct??'—'}% · 近3个月最多掉过 ${pct(rk.max_drawdown_90d)}</p>
+      <p>近3个月：高点 ${money(rk.peak_90d)} → 最低 ${money(rk.trough_90d)}（从高点约掉 ${pct(rk.max_drawdown_90d)}）</p>
+      <p>最近晃动程度 ${rk.vol20_daily_pct??'—'}%</p>
       ${histTable}
     </details>
   </div>
