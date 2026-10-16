@@ -6,6 +6,8 @@ Principles: real data only · no fabricated probabilities · clear invalidation 
 """
 
 import asyncio
+import csv
+import io
 import math
 import re
 import statistics
@@ -139,6 +141,78 @@ async def realtime(ticker: str) -> dict[str, Any]:
     }
 
 
+
+FRED = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+_macro_cache: dict[str, Any] = {"ts": 0, "data": {}}
+
+
+async def macro_background() -> dict[str, Any]:
+    import time as _time
+    now = _time.time()
+    if _macro_cache.get("data") and now - _macro_cache.get("ts", 0) < 900:
+        return _macro_cache["data"]
+
+    async def fred_one(client: httpx.AsyncClient, series: str):
+        try:
+            r = await client.get(FRED, params={"id": series}, timeout=15.0)
+            r.raise_for_status()
+            rows = [row for row in csv.DictReader(io.StringIO(r.text)) if row.get(series) not in (None, "", ".")]
+            if not rows:
+                return None
+            return {"value": float(rows[-1][series]), "date": rows[-1]["observation_date"]}
+        except Exception:
+            return None
+
+    headers = {"User-Agent": "Mozilla/5.0 Lighthouse/3.0"}
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+        fed, dgs10, dxy = await asyncio.gather(
+            fred_one(client, "FEDFUNDS"),
+            fred_one(client, "DGS10"),
+            fred_one(client, "DTWEXBGS"),
+        )
+    bits = []
+    if fed and isinstance(fed.get("value"), (int, float)):
+        v = fed["value"]
+        if v >= 4.5:
+            bits.append("政策利率仍偏高，借钱成本不低")
+        elif v <= 2.0:
+            bits.append("政策利率偏低，借钱相对便宜")
+        else:
+            bits.append("政策利率处于中间地带")
+    if dgs10 and isinstance(dgs10.get("value"), (int, float)):
+        v = dgs10["value"]
+        if v >= 4.0:
+            bits.append("长期利率偏高，对爱涨价的股票往往不太友好")
+        elif v <= 2.5:
+            bits.append("长期利率偏低，股票有时更容易被追捧")
+        else:
+            bits.append("长期利率不高不低")
+    if dxy and isinstance(dxy.get("value"), (int, float)):
+        v = dxy["value"]
+        if v >= 105:
+            bits.append("美元偏强时，全球风险资产常更吃力")
+        elif v <= 95:
+            bits.append("美元偏弱时，风险资产有时更容易抬头")
+        else:
+            bits.append("美元强弱大致中性")
+    out = {
+        "fed_funds": fed,
+        "ust_10y": dgs10,
+        "dollar_index": dxy,
+        "plain_lines": bits,
+        "how_it_works": (
+            "大环境不直接决定某只股票明天涨跌，但会影响大家愿不愿意买股票。"
+            "利率升高或美元变强时，股票常常更难涨、更容易晃；"
+            "利率回落或美元变弱时，往往更容易有人愿意买。"
+            "这只是常见倾向，不是定律，也不是买卖信号。"
+        ),
+        "label": "外面的大环境（只作背景，不合成买卖分）",
+    }
+    _macro_cache["ts"] = now
+    _macro_cache["data"] = out
+    return out
+
+
 def structure_state(close: list[float]) -> dict[str, Any]:
     """Deterministic regime labels — descriptive only, not a forecast score."""
     latest = close[-1]
@@ -201,15 +275,24 @@ def structure_state(close: list[float]) -> dict[str, Any]:
     }
 
 
+def window_peak_trough(values: list[float]) -> tuple[float | None, float | None]:
+    if not values:
+        return None, None
+    return max(values), min(values)
+
+
 def risk_metrics(close: list[float]) -> dict[str, Any]:
     latest = close[-1]
     daily = [close[i] / close[i - 1] - 1 for i in range(1, len(close))]
     vol20 = statistics.pstdev(daily[-20:]) if len(daily) >= 20 else None
     vol60 = statistics.pstdev(daily[-60:]) if len(daily) >= 60 else None
-    mdd_90 = max_drawdown(close[-91:]) if len(close) >= 91 else None
-    mdd_252 = max_drawdown(close[-253:]) if len(close) >= 253 else max_drawdown(close)
+    w90 = close[-91:] if len(close) >= 91 else close[:]
+    w252 = close[-253:] if len(close) >= 253 else close[:]
+    mdd_90 = max_drawdown(w90)
+    mdd_252 = max_drawdown(w252)
+    peak90, trough90 = window_peak_trough(w90)
+    peak252, trough252 = window_peak_trough(w252)
 
-    # Simple "if falls further" levels from current price
     stress = {
         "down_10pct": round(latest * 0.90, 2),
         "down_20pct": round(latest * 0.80, 2),
@@ -219,8 +302,12 @@ def risk_metrics(close: list[float]) -> dict[str, Any]:
     return {
         "vol20_daily_pct": round(vol20 * 100, 2) if vol20 is not None else None,
         "vol60_daily_pct": round(vol60 * 100, 2) if vol60 is not None else None,
-        "max_drawdown_90d": round(mdd_90, 4) if mdd_90 is not None else None,
-        "max_drawdown_252d": round(mdd_252, 4) if mdd_252 is not None else None,
+        "max_drawdown_90d": round(mdd_90, 4),
+        "max_drawdown_252d": round(mdd_252, 4),
+        "peak_90d": round(peak90, 2) if peak90 is not None else None,
+        "trough_90d": round(trough90, 2) if trough90 is not None else None,
+        "peak_252d": round(peak252, 2) if peak252 is not None else None,
+        "trough_252d": round(trough252, 2) if trough252 is not None else None,
         "stress_prices": stress,
     }
 
@@ -408,6 +495,14 @@ async def api_scan(refresh: bool = False):
     return _scan_cache
 
 
+@app.get("/api/macro")
+async def api_macro():
+    try:
+        return await macro_background()
+    except Exception:
+        return JSONResponse(status_code=502, content={"detail": "宏观数据暂时读不到"})
+
+
 @app.get("/api/universe")
 async def api_universe():
     return {"count": len(SCAN_UNIVERSE), "tickers": SCAN_UNIVERSE}
@@ -446,6 +541,7 @@ th,td{padding:6px;border-bottom:1px solid #eee;text-align:left}
 <button onclick="loadStock()">看看这只</button>
 <button class="secondary" onclick="loadScan(true)">刷新列表</button>
 </div>
+<div id="macro" class="card">大环境加载中…</div>
 <div id="scan" class="card">列表加载中…</div>
 <div id="result"></div>
 <script>
@@ -460,13 +556,35 @@ function plainState(st){
   if(st.state.indexOf('回升')>=0) return '还在平均价下面，不过最近有抬头，还没算真正翻过来。';
   return '上上下下拉锯，方向还不清楚。';
 }
+function money(x){return (typeof x==='number')?('$'+Number(x).toFixed(2)):'—'}
 function plainRisk(rk){
   const d90=rk&&rk.max_drawdown_90d;
   if(typeof d90!=='number')return '最近跌幅数据暂时没有。';
-  const a=Math.abs(d90*100).toFixed(0);
-  if(Math.abs(d90)>=0.25) return `最近大约3个月里，从高点最多掉过约 ${a}%。晃得比较大，仓位要自己掂量。`;
-  if(Math.abs(d90)>=0.12) return `最近大约3个月里，从高点最多掉过约 ${a}%。属于常见晃动。`;
-  return `最近大约3个月里，从高点最多掉过约 ${a}%。相对不算猛（以后未必如此）。`;
+  const a=Math.abs(d90*100).toFixed(1);
+  const peak=rk.peak_90d, trough=rk.trough_90d;
+  let s=`最近大约3个月里，高点大约在 ${money(peak)}，最低大约到 ${money(trough)}，等于从高点最多掉过约 ${a}%。`;
+  if(Math.abs(d90)>=0.25) s+=' 晃得比较大，仓位要自己掂量。';
+  else if(Math.abs(d90)>=0.12) s+=' 属于常见晃动。';
+  else s+=' 相对不算猛（以后未必如此）。';
+  return s;
+}
+async function loadMacro(){
+  try{
+    const m=await fetch('/api/macro').then(r=>r.json());
+    const lines=(m.plain_lines||[]).map(t=>'<p>· '+esc(t)+'</p>').join('');
+    document.getElementById('macro').innerHTML=
+      `<h2>外面的大环境</h2>
+       <p class="lead">${esc(m.how_it_works||'')}</p>
+       ${lines||'<p class="muted">句子生成中…</p>'}
+       <details><summary>具体数字（可点开）</summary>
+         ${m.fed_funds?`<p>美国政策利率：${m.fed_funds.value}（${esc(m.fed_funds.date)}）</p>`:''}
+         ${m.ust_10y?`<p>美国10年期国债利率：${m.ust_10y.value}（${esc(m.ust_10y.date)}）</p>`:''}
+         ${m.dollar_index?`<p>美元指数：${m.dollar_index.value}</p>`:''}
+       </details>
+       <p class="muted">${esc(m.label||'')}</p>`;
+  }catch(e){
+    document.getElementById('macro').innerHTML='<span class="error">大环境暂时读不到</span>';
+  }
 }
 async function loadScan(refresh=false){
   try{
@@ -481,8 +599,9 @@ async function loadScan(refresh=false){
         <p>${esc(plainState(st))}</p>
         <p class="muted">${esc(plainRisk(rk))}</p>
         <details><summary>数字细节（可点开）</summary>
+          <p class="muted">近3个月平均价 $${st.sma60} · 近半年平均价 $${st.sma120}</p>
           <p class="muted">近1个月涨跌 ${st.return_21d}% · 近3个月 ${st.return_63d}%</p>
-          <p class="muted">近3个月最多掉过 ${pct(rk.max_drawdown_90d)} · 最近晃动程度 ${rk.vol20_daily_pct??'—'}%</p>
+          <p class="muted">近3个月高点 ${money(rk.peak_90d)} → 最低 ${money(rk.trough_90d)}（约掉 ${pct(rk.max_drawdown_90d)}）</p>
         </details>
       </div>`;
     }).join('');
@@ -530,16 +649,17 @@ async function loadStock(){
         <p class="muted">${esc(rt.market_state||'')} · ${esc(rt.timestamp||'')}</p>
         <p><span class="${tag}">${esc(st.state)}</span></p>
         <p class="lead">${esc(plainState(st))}</p>
+        <p>近3个月平均价 <b>$${st.sma60}</b> · 近半年 <b>$${st.sma120}</b> · 近一年 <b>$${st.sma200??'—'}</b></p>
         <p class="warn">什么情况算变了：${esc(st.invalidation||'')}</p>
       </div>
       <div class="card">
         <h3>曾经跌过多少（先看这里）</h3>
         <p class="lead">${esc(plainRisk(rk))}</p>
-        <p>最近大约一年里，从高点最多掉过：<b>${pct(rk.max_drawdown_252d)}</b></p>
-        <p class="muted">如果从现在再跌 10% / 20% / 30%，价格大约到
-          $${rk.stress_prices?.down_10pct} /
-          $${rk.stress_prices?.down_20pct} /
-          $${rk.stress_prices?.down_30pct}</p>
+        <p>最近大约一年里：高点约 <b>${money(rk.peak_252d)}</b>，最低约 <b>${money(rk.trough_252d)}</b>，从高点最多掉过 <b>${pct(rk.max_drawdown_252d)}</b>。</p>
+        <p class="muted">如果从现在的 $${Number(rt.price).toFixed(2)} 再跌：<br>
+          跌10% → 约 $${rk.stress_prices?.down_10pct}<br>
+          跌20% → 约 $${rk.stress_prices?.down_20pct}<br>
+          跌30% → 约 $${rk.stress_prices?.down_30pct}</p>
       </div>
       <div class="card">
         <h3>以前遇到类似情况时</h3>
@@ -549,10 +669,10 @@ async function loadStock(){
       <div class="card">
         <details>
           <summary>数字细节（可点开）</summary>
-          <p>近3个月平均价 $${st.sma60} · 近半年平均价 $${st.sma120} · 近一年平均价 $${st.sma200??'—'}</p>
+          <p>近3个月平均价：<b>$${st.sma60}</b> · 近半年平均价：<b>$${st.sma120}</b> · 近一年平均价：<b>$${st.sma200??'—'}</b></p>
           <p>近1个月涨跌 ${st.return_21d}% · 近3个月 ${st.return_63d}%</p>
+          <p>近3个月：高点 ${money(rk.peak_90d)} → 最低 ${money(rk.trough_90d)}（从高点约掉 ${pct(rk.max_drawdown_90d)}）</p>
           <p>最近晃动程度（短/稍长）：${rk.vol20_daily_pct??'—'}% / ${rk.vol60_daily_pct??'—'}%</p>
-          <p>近3个月从高点最多掉过：${pct(rk.max_drawdown_90d)}</p>
           ${histTable}
         </details>
       </div>
@@ -561,7 +681,7 @@ async function loadStock(){
     box.innerHTML='<div class="card error">'+esc(e.message)+'</div>';
   }
 }
-loadScan();loadStock();
-setInterval(()=>loadScan(false),30000);
+loadMacro();loadScan();loadStock();
+setInterval(()=>{loadMacro();loadScan(false);},30000);
 </script></body></html>"""
     return HTMLResponse(html)
